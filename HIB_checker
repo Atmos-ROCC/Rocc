@@ -1,0 +1,18 @@
+read -ep "what issues would you like to check? [Filesytem|Capacity|Crashed|all] seperate each choice by a space: " choice; #!/bin/bash
+
+read -ep "what issues would you like to check? [Filesytem|Capacity|Crashed|all] seperate each choice by a space:" choice
+read -ep "would you like to list all dial home issues? " -n 1 list_choice
+for selection in ${choice[@]}
+	do for host in $(awk -F" |-bmc" '/bmc/{print $3}' /etc/hosts)
+		do echo -n $host
+			[[ "$selection" = filesystem ]] && echo -e " filesystems not in use\n" || echo -en " with $selection problems "
+			ssh $host "cd /opt/connectemc/archive; cat RSC*" | awk -F '[' '/CDATA/ {print$3}'| awk -F ']' '{print$1}' |  sed -e 's/^7$//g' -e 's/^Check.*//g' -e 's/^No extra.*//g' | grep -v ^$ | sort -u | 
+			 if [ "$list_choice" == n ]
+				then [[ "$selection" == all ]] && wc -l || [[ "$selection" == filesystem ]] && grep -i $selection | awk -F "Filesystem:|Disk:" '{print$2}' | sort -u || grep -c -i $selection
+				else [[ "$selection == all ]] && grep * || grep -c -i $selection
+			fi
+	done
+done
+
+
+read -ep "what issues would you like to check? [Filesytem|Capacity|Crashed|all] seperate each choice by a space:" choice; read -ep "would you like to list all dial home issues? " -n 1 list_choice; for selection in ${choice[@]};  do for host in $(awk -F" |-bmc" '/bmc/{print $3}' /etc/hosts); do echo -n $host; [[ "$selection" = filesystem ]] && echo -e " filesystems not in use\n" || echo -en " with $selection problems "; ssh $host "cd /opt/connectemc/archive; cat RSC*" | awk -F '[' '/CDATA/ {print$3}'| awk -F ']' '{print$1}' |  sed -e 's/^7$//g' -e 's/^Check.*//g' -e 's/^No extra.*//g' | grep -v ^$ | sort -u | if [ "$list_choice" == n ]; then [[ "$selection" == all ]] && wc -l || [[ "$selection" == filesystem ]] && grep -i $selection | awk -F "Filesystem:|Disk:" '{print$2}' | sort -u || grep -c -i $selection; else [[ "$selection" == all ]] && egrep ".*" || grep -i $selection; fi; done; done
