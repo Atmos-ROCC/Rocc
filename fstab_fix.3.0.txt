@@ -1,0 +1,299 @@
+#!/bin/bash
+##################################################################################
+#      fstab repair script -- all Atmos Versions                                 #
+#      Will edit and/or rewrite /etc/fstab                                       #
+#      Will also create folders and reset disk errors needed for disk mounts     #
+#                                                                                #
+#      Created and updated by the CS-ROCC Atmos team.                            #
+Version=3.1.6
+##################################################################################
+
+usage(){
+echo "
+This is a script that will fix issues with a corrupt or missing fstab.
+It will create mount point and reset disk error if possible.
+
+    Usage fstab.fix [options] 
+      -o   will omit certain fsuuid or dev path entries to be re-added to fstab
+      -h   shows this help file
+
+   Examples
+      fstab.fix                    
+      fstab.fix -o \"/dev/sdab /dev/sdc\"
+      fstab.fix -o /dev/sdab,/dev/sdc
+      fstab.fix -o 60971ab4-f88a-424c-8fc9-be7db22b1c36
+"
+}
+set_defaults(){
+####set colors####
+red=$(echo -e "\E[31m")
+green=$(echo -e "\E[0;92m")
+cyan=$(echo -e "\E[36m")
+clear_color=$(echo -e "\E[0m")
+yellow=$(echo -e "\E[0;33m")
+#####Gather initial info#####
+TotalPdisks=$(awk -F "<theoreticalDiskNum>|</theoreticalDiskNum>" '/theoreticalDiskNum/{print $2}' /var/local/maui/atmos-diskman/NODE/$(hostname)/latest.xml)
+if [[ $TotalPdisks -le 60 && $TotalPdisks -gt 30 ]]
+  then dbdisks=60
+elif [[ $TotalPdisks -le 30 && $TotalPdisks -gt 15 ]]
+  then dbdisks=30
+elif [[ $TotalPdisks -le 15 && $TotalPdisks -gt 0 ]]
+  then dbdisks=15
+fi
+rmgmaster=$(awk -F "," '/localDb/{print $2}' /etc/maui/cm_cfg.xml)
+allmds=$(chkconfig | awk -F "_| |." '{OFS=" "} /mauimds_|mauimdsremt_/ {print$2}')
+utilizedmdsfsuuids+=$(for i in ${allmds[@]}; do awk -F ">|<" '/value/ {print$3}' /var/local/maui/atmos-diskman/SC_SD_MDS/${i}/latest.xml ; done | sort -u)
+code_version=$(cat /etc/maui/atmos_version)
+barrier_opt=$(for i in $(awk -F "." '/hotfix/ {for (i = 5; i <= NF; i = i + 5) print$i}' /etc/maui/nodeconfig.xml); do [[ "${i}" == "395" ]] && echo yes; done)
+if [[ $barrier_opt == yes ]]
+  then gen1barrier="barrier=0 0 0"
+    gen3barrier="barrier"
+  else gen1barrier="barrier=1 0 0"
+    gen3barrier="nobarrier"
+fi
+[[ -z $barrier_opt ]] && barrier_opt="no"
+hardware=$(dmidecode | awk '/Product/ {print$NF}' | sort -u)
+case $hardware in
+  1950) hardware_gen=1
+  ;;
+  R610) harware_gen=2
+  ;;
+  S2600JF) mem=$(free -g | awk '/Mem/ {print$2}'); [[ "${mem}" -gt 35 ]] && hardware_gen=4 || hardware_gen=3
+  ;;
+esac
+[[ ${hardware_gen} == 1 ]] && fstype="ext3" || fstype="xfs"
+}
+gather_fsuuids(){
+if [[ "${hardware_gen}" -eq 1 ]]
+  then allfsuuids+=$(blkid | grep /dev/sd | grep LABEL | egrep 'ss"|mds"' | awk -F '"' '{print$4}')
+  else allfsuuids+=$(blkid | grep /dev/sd | grep UUID | grep xfs | awk -F '"' '{print$2}')
+fi
+####determines if a mixed disk or no and assigns mds and ss disks their fsuuids####
+if [[ $(ssh -q $rmgmaster grep dmMixDriveMode /etc/maui/maui_cfg.xml | grep -c true) -eq 0 ]]
+  then mixedisks="no"
+    ssfsuuids=${allfsuuids[@]}
+	mdsfsuuids=${utilizedmdsfsuuids[@]}
+    for i in ${utilizedmdsfsuuids[@]}
+      do ssfsuuids=${ssfsuuids[@]/${i}}
+	done
+  else mixeddisks="yes"
+    ssfsuuids=${allfsuuids[@]}
+	mdsfsuuids=${allfsuuids[@]}
+fi
+if [[ "${isThereBadDisks}" == "yes" ]]
+  then if [[ "${hardware_gen}" -eq 1 ]]
+    then for bad_disk in $(echo ${bad_disks[@]})
+        do bad_fsuuids+=$(blkid | grep ${bad_disk} | awk -F '"' '{print$4}')
+      done
+    else for bad_disk in $(echo ${bad_disks[@]})
+        do bad_fsuuids+=$(blkid | grep ${bad_disk} | awk -F '"' '{print$2}')
+      done
+	fi
+  for i in ${bad_fsuuids[@]}
+    do ssfsuuids=${ssfsuuids[@]/${i}}
+	  mdsfsuuids=${mdsfsuuids[@]/${i}}
+  done
+fi
+}
+get_boot_path(){
+####Determine the proper boot path####
+case "${hardware_gen}" in
+  1) boot_path=$(ls /dev/disk/by-id/scsi*-part2 | sed 's/part2/part1/g')
+  ;;
+  2) echo "gen2 hardware no supported yet"
+  exit
+  ;;
+  3) if [[ "${mixeddisks}" == "yes" ]]
+    then boot_path="/dev/disk/by-id/md-uuid-$(mdadm -D /dev/md126 | awk '/UUID/ {print$3}')-part1"
+	else boot_path="/dev/mds126p1"
+  fi
+  ;;
+  4)boot_path="/dev/disk/by-id/scsi-SATA_SATADOM-SL_3ME_$(smartctl -i /dev/sdbj1 | awk '/Serial Number:/ {print$NF}')-part1"
+  ;;
+esac
+}
+service_check(){
+#####Check if mauicm and mauiss are running and if not it fixes it######
+count=1
+echo "Checking to see if MauiCM is running..."
+while [[ $(service mauicm status | grep -q running | echo $?) == 1 ]]
+	do if [[ "${count}" -gt 1 ]]
+			then echo "${red}MauiCM is still not running!"
+				echo "${yellow}Trying to restart MauiCM again... ${count} attempt(s)"
+				service mauicm restart
+			else echo "${red}MauiCM is not running!"
+				echo "${yellow}Starting MauiCM...${clear_color}"
+				service mauicm start
+		fi
+		((count++))
+		if [["${count}" -gt 5 ]]
+			then echo -e "${red}MauiCM will not start.\n   ${yellow}Please investigate this issue before running this script${clear_color}\n      Exiting"
+			exit
+		fi
+		echo "waiting for MauiCM to initialize..."
+		sleep 30
+done
+echo "${green}MauiCM verification passed!"
+
+count=1
+echo "Checking to see if MauiSS is running..."
+while [[ $(service mauiss status | grep -q running | echo $?) == 1 ]]
+	do if [[ "${count}" -gt 1 ]]
+			then echo "${red}MauiSS is still not running!"
+				echo "${yellow}Trying to restart MauiSS again... ${count} attempt(s)"
+				service mauiss restart
+			else echo "${red}MauiSS is not running!"
+				echo "${yellow}Starting MauiSS...${clear_color}"
+				service mauiss start
+		fi
+		((count++))
+		if [["${count}" -gt 5 ]]
+			then echo -e "${red}MauiSS will not start.\n   ${yellow}Please investigate this issue before running this script${clear_color}"
+			exit
+		fi
+done
+echo "${green}MauiSS verification passed!"
+}
+initial_fstab_check() {
+#####Check the initial section of fstab###############
+echo "${yellow}Checking fstab for initial config."
+if [[ ! -e /etc/fstab ]]
+  then echo "No fstab file found"
+    touch /etc/fstab
+fi
+grep -q "# MODIFICATIONS TO THIS FILE MAY RESULT IN DATA UNAVAILABILITY!" /etc/fstab
+if [[ $? == 1 ]]
+  then echo "${red}fstab is empty!"
+    echo "Building initial fstab entry"
+    echo "# WARNING:
+# MODIFICATIONS TO THIS FILE MAY RESULT IN DATA UNAVAILABILITY!
+#
+# This file is managed by system and Atmos software automatically.
+# Please DO NOT TOUCH this file manually.
+
+devpts  /dev/pts          devpts  mode=0620,gid=5 0 0
+proc    /proc             proc    defaults        0 0
+sysfs   /sys              sysfs   noauto          0 0
+debugfs /sys/kernel/debug debugfs noauto          0 0
+usbfs   /proc/bus/usb     usbfs   noauto          0 0
+tmpfs   /run              tmpfs   noauto          0 0
+/dev/AtmosVG/LVRoot / xfs defaults 1 1
+/dev/AtmosVG/LVroot2 /root2 xfs defaults 1 2
+/dev/AtmosVG/LVvar /var xfs defaults 1 2
+${boot_path} /boot ext3 defaults 1 2
+/dev/AtmosVG/LVSwap swap swap defaults 0 0
+none    /cgroup    cgroup    defaults    0 0" > /etc/fstab
+  else echo "${green}Initial fstab config was found!${clear_color}"
+	echo "${yellow}Checking if boot disk is set up properly.${clear_color}"
+	grep -q ${boot_path} /etc/fstab
+	if [[ $? == 1 ]]
+	  then echo "${red}Boot disk was set incorrectly! This node would have rebooted into runlevel 1!"
+		echo "${yellow}Rewriting initial fstab config${clear_color}"
+		rm -rf /etc/fstab
+		initial_fstab_check
+	 fi
+fi
+}
+disk_count_check(){
+##confirms how many disks this script found###
+if [[ "$(echo ${allfsuuids[@]} | wc -w)" -lt "${dbdisks}" ]]
+  then echo "${red}Found only $(echo ${allfsuuids[@]} | wc -w)) disks via blkid."
+    echo "More investigation is needed to mount all disks${clear_color}\n${yellow}Script will continue to work with the disks it has found.${clear_color}"
+    missing_fsuuids=$(for i in $(ls /var/local/maui/atmos-diskman/SC_IU_SS/ | sed 's/default_SS_//g'); do blkid | head -60 | awk -F '"' '{print$2}' | grep -q $i; if [[ $? == 1 ]]; then echo $i;fi;done)
+	sleep 3
+	echo "this is a list of possible FSUUIDS that were not found via blkid"
+	echo ${missing_fsuuids}
+	echo "Please investigate these FSUUIDS to determine where the missing disk is."
+	sleep 3
+  else echo "${green}Found all 60 disks via blkid!${clear_color}"
+fi
+}
+mds_disk_fix(){
+
+###set up and mount all mds disks#####
+echo "${yellow}Fixing issues with the Atmos MDS disks found...${clear_color}"
+for i in ${mdsfsuuids[@]}
+  do ls /atmos/ | grep -q ${i}
+    if [[ $? == 1 ]]
+      then echo "${red}Atmos mount point for ${i} does not exist"
+        echo "${yellow}Creating directory${clear_color}"
+        mkdir /atmos/${i}
+    fi
+	echo ${utilzedmdsfsuuids[@]} | grep $i
+    if [[ $? == 0 ]]
+      then ls /mauimds-db/ | grep $i
+	    if [[ $? == 0 ]]
+		  then echo "${red}MDS symbolic link not detected for ${i}"
+            echo "${yellow}Creating symlink...${clear_color}"
+            ln -s /atmos/${i} /mauimds-db/${i}
+        fi
+	fi
+    grep -q "atmos/${i}" /etc/fstab
+    if [[ $? == 1 ]]
+      then echo "${red}Atmos Disk ${i} not found in fstab."
+        echo "${yellow}Adding Atmos disk ${i} to fstab...${clear_color}"
+        if [[ "${fstype}" == "xfs" ]]
+          then echo "UUID=${i} /atmos/${i} xfs inode64,${gen3barrier},noatime,nodiratime" >> /etc/fstab
+        elif [[ "${fstype}" == "ext3" ]]
+          then echo "UUID=${i} /atmos/${i}  ext3 noatime,nodiratime,${gen1barrier}" >> /etc/fstab
+        fi
+    fi
+	df -h | grep atmos | grep -q ${i}
+    if [[ $? == 1 ]]
+      then echo "${red}Atmos disk ${i} not mounted. ${yellow}Mounting...${clear_color}"
+        cmgenevent -E disk -T reuse --fsuuid=${i}
+    fi
+done
+}
+ss_disk_fix(){
+###Set up and mount all ss disks###
+echo "${yellow}Fixing issues with the Atmos SS disks found...${clear_color}"
+for i in ${ssfsuuids[@]}
+  do ls /mauiss-disks/ | grep -q ${i}
+    if [[ $? == 1 ]]
+      then echo "${red}Mauiss mount point for ${i} does not exist"
+        echo "${yellow}Creating directory${clear_color}"
+        mkdir /mauiss-disks/ss-${i}
+    fi
+  grep -q "mauiss-disks/ss-${i}" /etc/fstab
+    if [[ $? == 1 ]]
+      then echo "${red}Maui SS disk ${i} not found in fstab"
+        echo "${yellow}Adding Maui SS disk ${i} to fstab.${clear_color}"
+        if [[ "${fstype}" == "xfs" ]]
+          then echo "UUID=${i} /mauiss-disks/ss-${i} xfs inode64,${gen3barrier},noatime,nodiratime" >> /etc/fstab
+        elif [[ "${fstype}" == "ext3" ]]
+          then echo "UUID=${i} /mauiss-disks/ss-${i} ext3 noatime,nodiratime,${gen1barrier}" >> /etc/fstab
+        fi
+    fi
+  df -h | grep mauiss | grep -q ${i}
+  if [[ $? == 1 ]]
+    then echo "${red}Maui SS disk ${i} not mounted. ${yellow}Mounting...${clear_color}"
+      cmgenevent -E disk -T reuse --fsuuid=${i}
+  fi
+done
+mount -a
+}
+####main section####
+####gather options####
+while getopts "o:h" options;
+  do case $options in
+      o) bad_disks=$OPTARG
+        isThereBadDisks=yes
+      ;;
+      h)echo "there is no help section yet"
+      ;;
+    esac
+done
+####call functions####
+set_defaults
+gather_fsuuids
+get_boot_path
+service_check
+initial_fstab_check
+disk_count_check
+mds_disk_fix
+ss_disk_fix
+####final summary####
+echo "${green}Disk Check has finished"
+echo "There are now $(df -h | grep -c atmos) Atmos disks mounted"
+echo "There are now $(df -h | grep -c mauiss) Maui SS disks mounted"
